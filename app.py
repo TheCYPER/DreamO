@@ -17,6 +17,7 @@
 import argparse
 
 import torch
+from transformers import CLIPModel, CLIPProcessor
 import gradio as gr
 from dreamo_generator import Generator
 
@@ -120,6 +121,30 @@ def generate_image(
     return image, debug_images, seed
 
 
+_CLIP_MODEL = None
+_CLIP_PROCESSOR = None
+
+@torch.inference_mode()
+def evaluate_clip_score(generated_image, prompt_text: str):
+    """Return CLIP text-image cosine similarity in [0, 1]."""
+    if generated_image is None or not isinstance(prompt_text, str) or len(prompt_text.strip()) == 0:
+        return 0.0
+    global _CLIP_MODEL, _CLIP_PROCESSOR
+    if _CLIP_MODEL is None or _CLIP_PROCESSOR is None:
+        device = generator.device if "cuda" in str(generator.device) or "mps" in str(generator.device) else torch.device("cpu")
+        _CLIP_MODEL = CLIPModel.from_pretrained("openai/clip-vit-large-patch14").to(device)
+        _CLIP_PROCESSOR = CLIPProcessor.from_pretrained("openai/clip-vit-large-patch14")
+    inputs = _CLIP_PROCESSOR(text=[prompt_text], images=[generated_image], return_tensors="pt", padding=True)
+    inputs = {k: v.to(_CLIP_MODEL.device) for k, v in inputs.items()}
+    outputs = _CLIP_MODEL(**inputs)
+    image_embeds = outputs.image_embeds
+    text_embeds = outputs.text_embeds
+    image_embeds = image_embeds / image_embeds.norm(p=2, dim=-1, keepdim=True)
+    text_embeds = text_embeds / text_embeds.norm(p=2, dim=-1, keepdim=True)
+    similarity = (image_embeds @ text_embeds.t()).squeeze().item()
+    # map [-1,1] to [0,1]
+    return (similarity + 1.0) / 2.0
+
 _HEADER_ = '''
 <div style="text-align: center; max-width: 650px; margin: 0 auto;">
     <h1 style="font-size: 2.5rem; font-weight: 700; margin-bottom: 1rem; display: contents;">DreamO</h1>
@@ -164,6 +189,7 @@ def create_demo():
                         ref_task2 = gr.Dropdown(choices=["ip", "id", "style"], value="ip", label="task for ref image 2")
                 prompt = gr.Textbox(label="Prompt", value="a person playing guitar in the street")
                 generate_btn = gr.Button("🎉 Generate")
+                eval_btn = gr.Button("📏 Evaluate (CLIP)")
                 
                 width = gr.Slider(768, 1024, 1024, step=16, label="Width")
                 height = gr.Slider(768, 1024, 1024, step=16, label="Height")
@@ -192,6 +218,7 @@ def create_demo():
                     elem_id="gallery",
                 )
                 seed_output = gr.Textbox(label="Used Seed")
+                clip_score_output = gr.Number(label="CLIP Score [0-1]", value=None, precision=4)
 
         with gr.Row(), gr.Column():
             gr.Markdown("## Examples")
@@ -336,9 +363,15 @@ def create_demo():
             outputs=[output_image, debug_image, seed_output],
         )
 
+        eval_btn.click(
+            fn=evaluate_clip_score,
+            inputs=[output_image, prompt],
+            outputs=[clip_score_output],
+        )
+
     return demo
 
 
 if __name__ == '__main__':
     demo = create_demo()
-    demo.queue().launch(server_name='0.0.0.0', server_port=args.port)
+    demo.queue().launch(server_name='0.0.0.0', server_port=args.port, share=True)
